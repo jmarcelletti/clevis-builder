@@ -1,4 +1,5 @@
-FROM ubuntu:18.04
+ARG UBUNTU_VERSION=18.04
+FROM ubuntu:${UBUNTU_VERSION}
 
 # Requirements
 RUN apt-get update && \
@@ -67,4 +68,5 @@ RUN mkdir -p /out && \
     --depends libpwquality-tools \
     --depends luksmeta \
     /build/=/
+
 

@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 
-docker build -t clevis-builder:latest . 
+if [[ $# -ne 1 ]]; then
+    echo "Usage: $0 <ubuntu_version"
+    echo
+    echo "Example: $0 18.04"
+    echo "Example: $0 20.04"
+    echo
+    exit 1
+fi
 
-mkdir -p out/
-id=$(docker create clevis-builder:latest)
-docker cp ${id}:/out/. out/
+docker build --build-arg UBUNTU_VERSION=$1 -t clevis-builder:$1 .
+
+mkdir -p out/$1
+id=$(docker create clevis-builder:$1)
+docker cp ${id}:/out/. out/$1
 docker rm -v ${id}
+
