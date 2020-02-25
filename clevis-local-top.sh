@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash
 #
 # Copyright (c) 2017 Red Hat, Inc.
 # Copyright (c) 2017 Shawn Rose
@@ -24,10 +24,10 @@
 #
 
 case $1 in
-prereqs) exit 0;;
+prereqs) exit 0 ;;
 esac
 
-# Return fifo path or nothing if not found 
+# Return fifo path or nothing if not found
 get_fifo_path() {
     local pid="$1"
     for fd in /proc/$pid/fd/*; do
@@ -38,7 +38,6 @@ get_fifo_path() {
         fi
     done
 }
-
 
 # Print the PID of the askpass process and fifo path with a file descriptor opened to
 get_askpass_pid() {
@@ -53,35 +52,77 @@ get_askpass_pid() {
 }
 
 luks1_decrypt() {
-    luksmeta load "$@" \
-        | clevis decrypt
+    local CRYPTTAB_SOURCE=$1
+    local PASSFIFO=$2
+    UUID=cb6e8904-81ff-40da-a84a-07ab9ab5715e
+    luksmeta show -d "$CRYPTTAB_SOURCE" | while read -r slot state uuid; do
+        [ "$state" == "active" ] || continue
+        [ "$uuid" == "$UUID" ] || continue
 
-    local rc
-    for rc in "${PIPESTATUS[@]}"; do
-        [ $rc -eq 0 ] || return $rc
+        lml=$(luksmeta load -d "${CRYPTTAB_SOURCE}" -s "${slot}" -u "${UUID}")
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        decrypted=$(echo -n "${lml}" | clevis decrypt 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        # Fail safe
+        if [ "$decrypted" == "" ]; then
+            return 1
+        fi
+
+        echo -n "${decrypted}" >"$PASSFIFO"
+        return 0
     done
-    return 0
+
+    return 1
 }
 
-luks2_jwe() {
-    # jose jwe fmt -c outputs extra \n, so clean it up
-    cryptsetup token export "$@" \
-        | jose fmt -j- -Og jwe -o- \
-        | jose jwe fmt -i- -c \
-        | tr -d '\n'
+luks2_decrypt() {
+    local CRYPTTAB_SOURCE=$1
+    local PASSFIFO=$2
+    cryptsetup luksDump "$CRYPTTAB_SOURCE" | sed -rn 's|^\s+([0-9]+): clevis|\1|p' | while read -r id; do
 
-    local rc
-    for rc in "${PIPESTATUS[@]}"; do
-        [ $rc -eq 0 ] || return $rc
+        # jose jwe fmt -c outputs extra \n, so clean it up
+        cte=$(cryptsetup token export --token-id "$id" "$CRYPTTAB_SOURCE")
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        josefmt=$(echo ${cte} | jose fmt -j- -Og jwe -o-)
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        josejwe=$(echo ${josefmt} | jose jwe fmt -i- -c)
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        jwe=$(echo ${josejwe} | tr -d '\n')
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        decrypted=$(echo -n "${jwe}" | clevis decrypt 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+
+        echo -n "${decrypted}" >"$PASSFIFO"
+        return 0
     done
-    return 0
+
+    return 1
 }
 
 # Wait for askpass, and then try and decrypt immediately. Just in case
 # there are multiple devices that need decrypting, this will loop
 # infinitely (The local-bottom script will kill this after decryption)
-clevisloop()
-{
+clevisloop() {
     set -e
 
     # Set the path how we want it (Probably not all needed)
@@ -93,8 +134,6 @@ clevisloop()
         # This has to be escaped for awk
         cryptkeyscript='\/lib\/cryptsetup\/askpass'
     fi
-
-    PASSFIFO='/usr/lib/cryptsetup/passfifo'
 
     OLD_CRYPTTAB_SOURCE=""
 
@@ -113,35 +152,28 @@ clevisloop()
         # Make sure that CRYPTTAB_SOURCE is actually a block device
         [ ! -b "$CRYPTTAB_SOURCE" ] && continue
 
+        sleep .1
         # Make the source has changed if needed
         [ "$CRYPTTAB_SOURCE" = "$OLD_CRYPTTAB_SOURCE" ] && continue
-
         OLD_CRYPTTAB_SOURCE="$CRYPTTAB_SOURCE"
 
-        UUID=cb6e8904-81ff-40da-a84a-07ab9ab5715e
         if cryptsetup isLuks --type luks1 "$CRYPTTAB_SOURCE"; then
             # If the device is not initialized, sliently skip it.
             luksmeta test -d "$CRYPTTAB_SOURCE" || continue
 
-            luksmeta show -d "$CRYPTTAB_SOURCE" | while read -r slot state uuid; do
-                [ "$state" == "active" ] || continue
-                [ "$uuid" == "$UUID" ] || continue
-
-                if pt="$(luks1_decrypt -d "$CRYPTTAB_SOURCE" -s "$slot" -u "$UUID")"; then
-                    echo -n "$pt" > "$PASSFIFO"
-                    break
-                fi
-            done
+            if $(luks1_decrypt "${CRYPTTAB_SOURCE}" "${PASSFIFO}"); then
+                echo "Unlocked ${CRYPTTAB_SOURCE} with clevis"
+            else
+                OLD_CRYPTTAB_SOURCE=""
+                sleep 5
+            fi
         elif cryptsetup isLuks --type luks2 "$CRYPTTAB_SOURCE"; then
-            cryptsetup luksDump "$CRYPTTAB_SOURCE" | sed -rn 's|^\s+([0-9]+): clevis|\1|p' | while read -r id; do
-                jwe="$(luks2_jwe --token-id "$id" "$CRYPTTAB_SOURCE")" \
-                    || continue
-
-                if pt="$(echo -n "$jwe" | clevis decrypt)"; then
-                    echo -n "$pt" > "$PASSFIFO"
-                    break
-                fi
-            done
+            if $(luks2_decrypt "${CRYPTTAB_SOURCE}" "${PASSFIFO}"); then
+                echo "Unlocked ${CRYPTTAB_SOURCE} with clevis"
+            else
+                OLD_CRYPTTAB_SOURCE=""
+                sleep 5
+            fi
         fi
         # Now that the current device has its password, let's sleep a
         # bit. This gives cryptsetup time to actually decrypt the
@@ -152,35 +184,34 @@ clevisloop()
 
 . /scripts/functions
 
-
 # This is a copy  of 'all_netbootable_devices/all_non_enslaved_devices' for
 # platforms that might not provide it.
 clevis_all_netbootable_devices() {
-    for device in /sys/class/net/* ; do
-            if [ ! -e "$device/flags" ]; then
-                    continue
-            fi
+    for device in /sys/class/net/*; do
+        if [ ! -e "$device/flags" ]; then
+            continue
+        fi
 
-            loop=$(($(cat "$device/flags") & 0x8 && 1 || 0))
-            bc=$(($(cat "$device/flags") & 0x2 && 1 || 0))
-            ptp=$(($(cat "$device/flags") & 0x10 && 1 || 0))
+        loop=$(($(cat "$device/flags") & 0x8 && 1 || 0))
+        bc=$(($(cat "$device/flags") & 0x2 && 1 || 0))
+        ptp=$(($(cat "$device/flags") & 0x10 && 1 || 0))
 
-            # Skip any device that is a loopback
-            if [ $loop = 1 ]; then
-                    continue
-            fi
+        # Skip any device that is a loopback
+        if [ $loop = 1 ]; then
+            continue
+        fi
 
-            # Skip any device that isn't a broadcast
-            # or point-to-point.
-            if [ $bc = 0 ] && [ $ptp = 0 ]; then
-                    continue
-            fi
+        # Skip any device that isn't a broadcast
+        # or point-to-point.
+        if [ $bc = 0 ] && [ $ptp = 0 ]; then
+            continue
+        fi
 
-            # Skip any enslaved device (has "master" link
-            # attribute on it)
-            device=$(basename "$device")
-            ip -o link show "$device" | grep -q -w master && continue
-            DEVICE="$DEVICE $device"
+        # Skip any enslaved device (has "master" link
+        # attribute on it)
+        device=$(basename "$device")
+        ip -o link show "$device" | grep -q -w master && continue
+        DEVICE="$DEVICE $device"
     done
     echo "$DEVICE"
 }
@@ -204,5 +235,5 @@ if eth_check; then
 fi
 
 clevisloop &
-echo $! > /run/clevis.pid
+echo $! >/run/clevis.pid
 

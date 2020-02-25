@@ -41,7 +41,7 @@ RUN mkdir -p /tmp && \
     echo "DONE"
 
 # Our patch
-COPY clevis-local-top /build/usr/share/initramfs-tools/scripts/local-top/clevis
+COPY clevis-local-top.sh /build/usr/share/initramfs-tools/scripts/local-top/clevis
 
 RUN chmod 755 /build/usr/share/initramfs-tools/scripts/local-top/clevis
 
