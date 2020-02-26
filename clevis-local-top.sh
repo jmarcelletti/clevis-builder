@@ -60,19 +60,13 @@ luks1_decrypt() {
         [ "$uuid" == "$UUID" ] || continue
 
         lml=$(luksmeta load -d "${CRYPTTAB_SOURCE}" -s "${slot}" -u "${UUID}")
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
 
         decrypted=$(echo -n "${lml}" | clevis decrypt 2>/dev/null)
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
 
         # Fail safe
-        if [ "$decrypted" == "" ]; then
-            return 1
-        fi
+        [ "$decrypted" != "" ] || continue
 
         echo -n "${decrypted}" >"$PASSFIFO"
         return 0
@@ -85,32 +79,24 @@ luks2_decrypt() {
     local CRYPTTAB_SOURCE=$1
     local PASSFIFO=$2
     cryptsetup luksDump "$CRYPTTAB_SOURCE" | sed -rn 's|^\s+([0-9]+): clevis|\1|p' | while read -r id; do
-
         # jose jwe fmt -c outputs extra \n, so clean it up
         cte=$(cryptsetup token export --token-id "$id" "$CRYPTTAB_SOURCE")
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
 
         josefmt=$(echo ${cte} | jose fmt -j- -Og jwe -o-)
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
 
         josejwe=$(echo ${josefmt} | jose jwe fmt -i- -c)
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
 
         jwe=$(echo ${josejwe} | tr -d '\n')
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
 
         decrypted=$(echo -n "${jwe}" | clevis decrypt 2>/dev/null)
-        if [ $? -ne 0 ]; then
-            return 1
-        fi
+        [ $? -eq 0 ] || continue
+
+        # Fail safe
+        [ "$decrypted" != "" ] || continue
 
         echo -n "${decrypted}" >"$PASSFIFO"
         return 0
